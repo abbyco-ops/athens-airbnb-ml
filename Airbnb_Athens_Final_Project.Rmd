@@ -1,0 +1,985 @@
+---
+title: "What Drives Airbnb Occupancy in Athens?"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+## A Supervised Machine Learning Analysis of Airbnb Listings in Athens, Greece
+
+#### Abigaile Co
+
+#### UCSB Spring 2026
+
+# Introduction
+
+Athens, Greece is one of Europe's most visited cities, drawing millions of tourists each year to its ancient landmarks, vibrant neighborhoods, and Mediterranean culture. As short-term rental platforms like Airbnb have grown in popularity, Athens has become a competitive hosting market with thousands of active listings. For travelers, especially groups of friends or families looking to split costs, finding the right listing at the right place can be a challenge. From a host's perspective, understanding what drives a listing's success is equally important.
+
+This project uses publicaly available data from [Inside Airbnb](https://insideairbnb.com/get-the-data/){.uri} to **predict** whether an Airbnb listing in Athens achieves **high occupancy**. High occupancy is defined as a listing having below-median availability over the course of a year. This follows the idea that a listing with fewer open days has likely been booked more often. This is a **binary** **classification** **problem**: we want to predict whether a given listing falls into the "High Occupancy" or "Low Occupancy" category based on features like price, number of bedrooms, host characteristics, and neighborhood. To do this, we apply supervised machine learning techniques, training and **comparing several classification algorithms** on labeled listing data to find the model that best distinguishes high-occupancy listings from low-occupancy ones.
+
+<img src="Athens_Aura.JPG" alt="Photo From My Trip to Athens, Greece" width="700"/>
+
+## Project Roadmap
+
+The analysis is structured as follows: we begin with **exploratory data analysis (EDA)** to understand the distribution of key variables and how they relate to occupancy. We then split the data into training and testing sets and use **k-fold cross-validation** to fit and compare four types of models: logistic regression, a pruned decision tree, an elastic net, and a random forest. Tuneable models are tuned using cross-validation, and the best-performing model is evaluated on the held-out test set.
+
+**One important caveat**: `availability_365` is not a perfect measure of bookings. A host may block dates for personal use or seasonal reasons, which would also show up as low availability. This **limitation** is acknowledged throughout the report, and results should be interpreted accordingly.
+
+**Data Source:** Inside Airbnb. (2025, September 26). *Athens, Attica, Greece listings data* [Data set]. Retrieved from <https://insideairbnb.com/get-the-data/>
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(ggplot2)
+library(corrr)
+library(vip)
+library(rpart.plot)
+library(knitr)
+library(kableExtra)
+library(kknn)       # for KNN
+library(discrim)    # for LDA and QDA
+library(glmnet)     # for Lasso (likely already installed with tidymodels)
+
+tidymodels_prefer()
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 8,
+  fig.height = 5
+)
+#install.packages("janitor")
+#install.packages("kknn")
+#install.packages("discrim")
+```
+
+# Exploratory Data Analysis (EDA)
+
+In this section, we visually explore the dataset to understand the distribution of our outcome variable, the relationships between key predictors and occupancy, and any patterns worth noting before modeling. Good EDA helps us catch anomalies and develop intuition about which features might be most predictive.
+
+## Loading the Raw Data
+
+We begin by loading the raw listings data from Inside Airbnb and cleaning the column names using `janitor::clean_names()`.
+
+```{r load-data}
+airbnb_raw <- read_csv("listings.csv") %>% clean_names()
+```
+
+## Missing Data
+
+Before cleaning, we check the missingness rate for our key variables. Understanding where data is missing helps us decide how to handle it. Here, we use median imputation for numeric variables and mode imputation for categorical ones.
+
+```{r missing-data}
+missing_summary <- airbnb_raw %>%
+  select(
+    price, accommodates, bedrooms, beds, room_type,
+    number_of_reviews, review_scores_rating,
+    host_is_superhost, instant_bookable,
+    neighbourhood_cleansed, availability_365
+  ) %>%
+  summarise(across(everything(), ~ round(mean(is.na(.)) * 100, 1))) %>%
+  pivot_longer(everything(),
+               names_to  = "Variable",
+               values_to = "Missing (%)") %>%
+  arrange(desc(`Missing (%)`))
+
+missing_summary %>%
+  kable(caption = "Missing Data Rates for Key Variables (%)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The variable with the most missingness is `review_scores_rating` (15.0%), which is expected: listings with no reviews yet have no rating to report, so this is a structural feature of new or low-activity listings rather than a data-entry error. Imputing this with the overall median therefore assumes these unreviewed listings would have rated "typically" had they been reviewed. This is a simplifying assumption worth flagging as a limitation, since it likely understates the heterogeneity between new and established listings.
+
+`beds` (6.9%) and `host_is_superhost` (6.0%) also have non-trivial missingness, more plausibly attributable to incomplete host-provided fields than to any pattern tied to the outcome. `bedrooms` (0.7%) is missing at a much lower rate. All four are numeric or binary-categorical and are handled in the recipe via `step_impute_median()` (numeric: `review_scores_rating`, `beds`, `bedrooms`) and `step_impute_mode()` (categorical: `host_is_superhost`), chosen for robustness to the skew typical of count- and rating-type variables, at the cost of slightly compressing variance in those columns.
+
+`price` is the one exception: its 6.8% missingness is **not** imputed. Rows with missing price are dropped during cleaning (`filter(!is.na(price))`), before the recipe is ever applied. This is a deliberate but consequential choice. Listwise deletion assumes price is missing independent of occupancy, whereas median imputation would assume missing prices are "typical." Given that price turns out to be the single most important predictor in the final model, this choice is worth flagging explicitly rather than leaving it implicit in the cleaning code.
+
+## Feature Engineering
+
+We engineer two new variables: `price_per_person` (price divided by accommodates, to capture affordability for groups) and our outcome variable `high_occupancy` (a binary flag for listings with below-median `availability_365`).
+
+```{r clean-data}
+airbnb_clean <- airbnb_raw %>%
+  mutate(
+    price           = parse_number(price),
+    price_per_person = price / accommodates,
+    high_occupancy  = if_else(
+      availability_365 < median(availability_365, na.rm = TRUE),
+      "High Occupancy",
+      "Low Occupancy"
+    ),
+    high_occupancy         = factor(high_occupancy),
+    room_type              = factor(room_type),
+    host_is_superhost      = factor(host_is_superhost),
+    instant_bookable       = factor(instant_bookable),
+    neighbourhood_cleansed = factor(neighbourhood_cleansed)
+  ) %>%
+  select(
+    high_occupancy,
+    availability_365,
+    price,
+    price_per_person,
+    accommodates,
+    bedrooms,
+    beds,
+    room_type,
+    number_of_reviews,
+    review_scores_rating,
+    host_is_superhost,
+    instant_bookable,
+    neighbourhood_cleansed
+  ) %>%
+  filter(
+    !is.na(price),
+    price > 0,
+    accommodates > 0,
+    !is.na(high_occupancy)
+  )
+
+cat("Total observations after cleaning:", nrow(airbnb_clean), "\n")
+cat("Total features:", ncol(airbnb_clean) - 1, "\n")
+```
+
+After filtering out invalid entries (zero or missing price, missing outcome), we have exactly 14524 listings and 12 predictors to work with.
+
+## Plot 1: Distribution of Outcome Variable
+
+Our first step in any EDA is to look at the distribution of the outcome we are trying to predict. Since we defined `high_occupancy` using the median of `availability_365`, we expect a roughly balanced split (this is by design).
+
+```{r eda-outcome}
+airbnb_clean %>%
+  count(high_occupancy) %>%
+  mutate(percent = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = high_occupancy, y = n, fill = high_occupancy)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, "\n(", percent, "%)")),
+            vjust = -0.4, size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c("High Occupancy" = "#2196F3",
+                               "Low Occupancy"  = "#90CAF9")) +
+  labs(
+    title = "Distribution of High vs. Low Occupancy Listings",
+    subtitle = "Outcome variable is nearly balanced by construction (median split)",
+    x = NULL, y = "Number of Listings"
+  ) +
+  theme_minimal(base_size = 13) +
+  ylim(0, max(airbnb_clean %>% count(high_occupancy) %>% pull(n)) * 1.15)
+```
+
+As expected, the two classes are nearly equal in size (roughly 50/50). The split is not precisely 50/50 because `availability_365` is a discrete integer variable. Hence, when you split the median, ties at the median value all fall to one side, which pushes the classes slightly off 50/50. This is a useful property for modeling because we do not need to worry about severe class imbalance causing our model to predict the majority class every time.
+
+## Plot 2: Price Per Person Per Occupancy
+
+A central question in this project is whether price affects occupancy. We use `price_per_person` (nightly price divided by number of guests the listing accommodates) as a more group-travel-relevant measure of affordability. Listings with extreme prices are capped at the 99th percentile for clarity.
+
+```{r eda-price}
+price_cap <- quantile(airbnb_clean$price_per_person, 0.99, na.rm = TRUE)
+
+airbnb_clean %>%
+  filter(price_per_person <= price_cap) %>%
+  ggplot(aes(x = high_occupancy, y = price_per_person, fill = high_occupancy)) +
+  geom_boxplot(alpha = 0.8, outlier.alpha = 0.2, outlier.size = 0.8,
+               show.legend = FALSE) +
+  scale_fill_manual(values = c("High Occupancy" = "#2196F3",
+                               "Low Occupancy"  = "#90CAF9")) +
+  labs(
+    title = "Nightly Price Per Person by Occupancy Status",
+    subtitle = "Prices capped at 99th percentile for readability",
+    x = NULL,
+    y = "Price Per Person (€)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+High-occupancy listings tend to have a **lower median price per person** than low-occupancy listings. This makes intuitive sense: more affordable listings attract more bookings, particularly for budget-conscious groups. The distributions overlap substantially, so price alone is not a perfect predictor, but it appears to be a meaningful signal.
+
+## Plot 3: Room Type by Occupancy
+
+Room type is another feature we expect to matter. Entire homes are preferred by groups wanting privacy, while private rooms may appeal more to solo travelers or couples. We examine how the mix of room types differs between high- and low-occupancy listings.
+
+```{r eda-roomtype}
+airbnb_clean %>%
+  count(high_occupancy, room_type) %>%
+  group_by(room_type) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(room_type, pct), y = pct, fill = high_occupancy)) +
+  geom_col(position = "dodge", width = 0.6) +
+  scale_fill_manual(values = c("High Occupancy" = "#2196F3",
+                               "Low Occupancy"  = "#90CAF9"),
+                    name = NULL) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  coord_flip() +
+  labs(
+    title = "Proportion of High vs. Low Occupancy by Room Type",
+    x = NULL,
+    y = "Proportion Within Room Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+Shared rooms stand out as having the lowest proportion of high-occupancy listings by far (\~17% compared to over 80% low occupancy). Speaking from experiences, this may reflect that shared rooms in Athens are less popular with tourists who prefer privacy. Another possible explanation for this could be that those booking with Airbnb prefer privacy, and those who don't care enough opt for hostel bookings outside of Airbnb. Private rooms and hotel rooms show a modest lean toward high occupancy, while entire homes/apartments are nearly balanced. This is somewhat surprising given the group travel focus of this project. Entire homes are the most natural choice for groups, yet they do not appear to book more frequently than other room types at the aggregate level. One possible explanation is that entire homes are more common on the platform overall, creating more supply-side competition.
+
+## Plot 4: Number of Reviews by Occupancy
+
+The number of reviews a listing has received is often used as a proxy for booking history. More reviews generally means more past guests. We expect high-occupancy listings to have more reviews.
+
+```{r eda-reviews}
+reviews_cap <- quantile(airbnb_clean$number_of_reviews, 0.97, na.rm = TRUE)
+
+airbnb_clean %>%
+  filter(number_of_reviews <= reviews_cap) %>%
+  ggplot(aes(x = high_occupancy, y = number_of_reviews, fill = high_occupancy)) +
+  geom_boxplot(alpha = 0.8, outlier.alpha = 0.2, show.legend = FALSE) +
+  scale_fill_manual(values = c("High Occupancy" = "#2196F3",
+                               "Low Occupancy"  = "#90CAF9")) +
+  labs(title = "Number of Reviews by Occupancy Status",
+       x = NULL, y = "Number of Reviews") +
+  theme_minimal(base_size = 13)
+```
+
+High-occupancy listings have a modestly higher median review count and a wider spread, suggesting that more established, well-reviewed listings tend to achieve better occupancy. However, the difference between the two groups is not dramatic. Both distributions are heavily right-skewed with most listings having relatively few reviews. The more notable pattern is that high-occupancy listings accumulate more extreme review counts, indicating that the longest-running, most-booked listings in Athens skew toward the high-occupancy category.
+
+## Plot 5: Superhost Status and Instant Bookable vs. Occupancy
+
+Finally, we look at two binary host-level features: whether the host is a superhost (a verified, high-quality host) and whether the listing is instantly bookable (no approval required). Both might reduce friction for potential guests and lead to more bookings.
+
+```{r eda-host-features}
+p1 <- airbnb_clean %>%
+  filter(!is.na(host_is_superhost)) %>%
+  count(high_occupancy, host_is_superhost) %>%
+  group_by(host_is_superhost) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x = host_is_superhost, y = pct, fill = high_occupancy)) +
+  geom_col(position = "dodge", width = 0.5) +
+  scale_fill_manual(values = c("High Occupancy" = "#2196F3",
+                               "Low Occupancy"  = "#90CAF9"),
+                    name = NULL) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_x_discrete(labels = c("f" = "Not Superhost", "t" = "Superhost")) +
+  labs(title = "Superhost Status", x = NULL, y = "Proportion") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+p2 <- airbnb_clean %>%
+  filter(!is.na(instant_bookable)) %>%
+  count(high_occupancy, instant_bookable) %>%
+  group_by(instant_bookable) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x = instant_bookable, y = pct, fill = high_occupancy)) +
+  geom_col(position = "dodge", width = 0.5) +
+  scale_fill_manual(values = c("High Occupancy" = "#2196F3",
+                               "Low Occupancy"  = "#90CAF9"),
+                    name = NULL) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_x_discrete(labels = c("f" = "Not Instant", "t" = "Instant")) +
+  labs(title = "Instant Bookable", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+gridExtra::grid.arrange(p1, p2, ncol = 2,
+  top = "Host Features vs. Occupancy Status")
+```
+
+**Superhost status appears to have virtually no relationship with occupancy**. The proportion of high- and low-occupancy listings is nearly identical whether a host is a superhost or not. Instant bookability tells a more interesting story: listings that are not instantly bookable have a slightly higher proportion of high-occupancy listings, which is counterintuitive. One possible explanation is that hosts who require approval may be more selective or experienced, managing their calendars more actively in ways that correlate with higher demand.
+
+## Plot 6: Listing Capacity
+
+The number of beds in a listing is directly relevant to group travel—larger groups need more beds. This was something I experienced firsthand while studying abroad: when my friends and I were planning a trip to Athens, one of the first filters we used on Airbnb was the number of beds, since splitting the cost of a larger listing among more people was almost always cheaper than booking separate smaller ones. We examine whether listings with more beds tend to achieve higher occupancy.
+
+```{r eda-accommodates}
+airbnb_clean %>%
+  ggplot(aes(x = high_occupancy, y = accommodates, fill = high_occupancy)) +
+  geom_boxplot(alpha = 0.8, outlier.alpha = 0.2, outlier.size = 0.8,
+               show.legend = FALSE) +
+  scale_fill_manual(values = c("High Occupancy" = "#2196F3",
+                               "Low Occupancy"  = "#90CAF9")) +
+  labs(
+    title = "Listing Capacity (Accommodates) by Occupancy Status",
+    x = NULL,
+    y = "Number of Guests Accommodated"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+Interestingly, **listing capacity** (`accommodates`) **showed no meaningful difference between high- and low-occupancy** listings, suggesting that group-size suitability alone does not drive occupancy in Athens. This may reflect that the Athens Airbnb market is broad enough that both small and large listings achieve similar booking rates, and that price and review volume are more important drivers of demand than physical capacity.
+
+# Setting Up Models
+
+## Train/Test Split
+
+Before fitting any models, we split the data into a **training set** (80%) and a **test set** (20%). The training set is used to fit and tune our models; the test set is held out entirely until the very end, when we evaluate our best model's true performance on unseen data. We use **stratified sampling** on the outcome variable to ensure both sets have approximately the same proportion of high- and low-occupancy listings.
+
+```{r split}
+set.seed(123)
+
+airbnb_split <- initial_split(
+  airbnb_clean,
+  prop    = 0.80,
+  strata  = high_occupancy
+)
+
+airbnb_train <- training(airbnb_split)
+airbnb_test  <- testing(airbnb_split)
+
+cat("Training set:", nrow(airbnb_train), "observations\n")
+cat("Testing set: ", nrow(airbnb_test),  "observations\n")
+```
+
+## Cross-Validation
+
+Rather than evaluating models directly on the test set during training (which would lead to overfitting), we use **5-fold cross-validation** on the training data. In k-fold cross-validation, the training data is divided into 5 equally sized "folds." The model is trained on 4 of the folds and evaluated on the remaining fold, then the process repeats 5 times—each fold serving as the evaluation set once. The results are averaged, giving us a reliable estimate of how the model will perform on new data.
+
+```{r cv-folds}
+set.seed(123)
+airbnb_folds <- vfold_cv(
+  airbnb_train,
+  v      = 5,
+  strata = high_occupancy
+)
+
+airbnb_folds
+```
+
+## Recipe
+
+In machine learning, a *recipe* is a set of preprocessing instructions that tells our models how to prepare the raw data before training begins. Think of it like packing for a trip to Athens: before you can enjoy your vacation, you need to organize your luggage—folding clothes neatly, converting your currency, and making sure you don't get held up at security because of accidentally forgetting your favorite YLS Libre Eau De Parfum with Orange Blossom & Lavendar exceeds the TSA liquid limit #RIP. In the same way, our recipe takes the raw Airbnb listing data and gets it "travel-ready" for our models. This includes imputing missing values (filling in the gaps, like a travel agent confirming unresolved booking details), converting categorical variables like `room_type` and `neighbourhood_cleansed` into a numerical format our models can read through dummy encoding (translating the local language, so to speak), normalizing numeric predictors so that a variable like `price` doesn't overshadow a variable like `review_scores_rating` simply because of its larger scale, and removing any zero-variance predictors that add no useful information. Just as a well-packed suitcase makes for a smoother trip, a well-specified recipe ensures our models receive clean, consistent, and informative data, setting them up for the best possible performance.
+
+```{r recipe}
+airbnb_recipe <- recipe(high_occupancy ~ ., data = airbnb_train) %>%
+  update_role(availability_365, new_role = "ID") %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+# Model Fitting
+
+We fit four types of models, ranging from simple and interpretable to more complex and powerful. For each model type that has tunable hyperparameters, we use cross-validation to find the best settings.
+
+## Model 1: Logistic Regression (Baseline)
+
+Logistic regression is a classic and interpretable classification model. It estimates the probability that a listing belongs to the "High Occupancy" class based on a linear combination of its features. It requires no hyperparameter tuning, making it a useful baseline.
+
+```{r log-reg}
+log_model <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_workflow <- workflow() %>%
+  add_recipe(airbnb_recipe) %>%
+  add_model(log_model)
+
+log_res <- fit_resamples(
+  log_workflow,
+  resamples = airbnb_folds,
+  metrics   = metric_set(accuracy, roc_auc, sens, spec),
+  control   = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(log_res) %>%
+  select(.metric, mean, std_err) %>%
+  rename(Metric = .metric, Mean = mean, `Std Error` = std_err) %>%
+  kable(caption = "Logistic Regression: Cross-Validation Performance", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The logistic regression baseline performs modestly, correctly classifying about 57% of listings. That's only slightly better than random guessing (50%), so not impressive. The `roc_auc` confirms the model barely does better than a coin flip at distinguishing high vs. low occupancy. A perfect model would be 1.0; random is 0.5. The model shows a notable imbalance between sensitivity (0.391) and specificity (0.727), meaning it is much better at identifying low-occupancy listings than high-occupancy ones. This suggests that the linear relationships captured by logistic regression are not sufficient to distinguish high-occupancy listings reliably, and that more flexible models may be needed. These results serve as a useful baseline against which our more complex models can be compared.
+
+## Model 2: Pruned Decision Tree (Tuned)
+
+A decision tree works by repeatedly splitting the data into smaller and smaller groups based on feature thresholds. For example, "does this listing have a price per person below €25?" or "does it have more than 10 reviews?" At each split, the tree tries to create groups that are as "pure" as possible, meaning one group contains mostly High Occupancy listings and the other contains mostly Low Occupancy listings. The tree keeps splitting until it has perfectly separated every listing, but this is actually a problem. A tree that grows too deep ends up memorizing the training data rather than learning generalizable patterns, a problem known as **overfitting**. It becomes so specific to the quirks of the training set that it performs poorly on new, unseen listings.
+
+To prevent this, we tune the **cost complexity** parameter (`cost_complexity`), which works like a pruning shear on a overgrown hedge. After the tree has fully grown, cost complexity trims back branches that do not contribute enough predictive improvement to justify their added complexity. A small cost complexity value allows the tree to stay bushy and detailed, while a large value prunes it aggressively, potentially all the way down to a single split. The **goal** is to find the sweet spot in between. Hence, a tree that is simple enough to generalize well to new data, but complex enough to still capture meaningful patterns. We find this sweet spot using cross-validation, trying several values of `cost_complexity` and selecting the one that produces the best performance on held-out folds.
+
+```{r tree-tune}
+tree_model <- decision_tree(cost_complexity = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+tree_workflow <- workflow() %>%
+  add_recipe(airbnb_recipe) %>%
+  add_model(tree_model)
+
+tree_grid <- grid_regular(
+  cost_complexity(range = c(-4, -1)),
+  levels = 10
+)
+
+set.seed(123)
+tree_tune_res <- tune_grid(
+  tree_workflow,
+  resamples = airbnb_folds,
+  grid      = tree_grid,
+  metrics   = metric_set(accuracy, roc_auc)
+)
+
+autoplot(tree_tune_res) +
+  labs(title = "Decision Tree: Tuning Cost Complexity") +
+  theme_minimal(base_size = 12)
+```
+
+```{r tree-best}
+best_tree <- select_best(tree_tune_res, metric = "roc_auc")
+cat("Best cost_complexity:", best_tree$cost_complexity, "\n")
+
+tree_final_workflow <- finalize_workflow(tree_workflow, best_tree)
+
+tree_res <- fit_resamples(
+  tree_final_workflow,
+  resamples = airbnb_folds,
+  metrics   = metric_set(accuracy, roc_auc, sens, spec),
+  control   = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(tree_res) %>%
+  select(.metric, mean, std_err) %>%
+  rename(Metric = .metric, Mean = mean, `Std Error` = std_err) %>%
+  kable(caption = "Decision Tree (Tuned): Cross-Validation Performance", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The tuning plot shows that performance peaks around a cost-complexity of 1e-03 and then degrades sharply at 1e-01, which is the model being pruned too aggressively into something too simple. The best cross-validation performance landed at accuracy \~0.564 and ROC AUC \~0.576. Sensitivity (0.503) and specificity (0.619) are notably unbalanced. The model is better at correctly identifying Low Occupancy listings than High Occupancy ones.
+
+## Model 3: Lasso (Tuned)
+
+Lasso regression is a **variant of logistic regression** that adds a **penalty for model complexity**, specifically by shrinking some predictor coefficients all the way to zero. This makes Lasso useful for two purposes simultaneously: prediction and variable selection. When many predictors are included—such as the case here with price, neighborhood dummies, room type, host characteristics, and more—some may contribute very little signal. Lasso automatically identifies and removes those predictors by zeroing out their coefficients, leaving only the most informative ones. The key tuning parameter is the penalty strength: a small penalty leaves the model close to standard logistic regression, while a large penalty shrinks more and more coefficients to zero until eventually the model predicts only the majority class.
+
+```{r}
+lasso_model <- logistic_reg(
+  penalty = tune(),
+  mixture = 1  # mixture = 1 means pure Lasso
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+lasso_workflow <- workflow() %>%
+  add_recipe(airbnb_recipe) %>%
+  add_model(lasso_model)
+
+lasso_grid <- tibble(penalty = 10^seq(-4, 0, length.out = 20))
+
+set.seed(123)
+lasso_res <- tune_grid(
+  lasso_workflow,
+  resamples = airbnb_folds,
+  grid = lasso_grid,
+  metrics = metric_set(accuracy, roc_auc, sens, spec),
+  control = control_grid(save_pred = TRUE)
+)
+
+# Plot tuning results
+autoplot(lasso_res) + 
+  labs(title="Lasso: Tuning Penalty") +
+  theme_minimal(base_size=12)
+```
+
+```{r}
+# Best Lasso penalty
+show_best(lasso_res, metric = "roc_auc", n = 5)
+
+# Finalize Lasso
+best_lasso <- select_best(lasso_res, metric = "roc_auc")
+
+lasso_final_workflow <- finalize_workflow(lasso_workflow, best_lasso)
+
+lasso_final_res <- fit_resamples(
+  lasso_final_workflow,
+  resamples = airbnb_folds,
+  metrics = metric_set(accuracy, roc_auc, sens, spec),
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(lasso_final_res) %>%
+  select(.metric, mean, std_err) %>%
+  rename(Metric = .metric, Mean=mean, `Std Error` = std_err) %>%
+  kable(caption="Lasso (Tuned): Cross Validation Performance", digits=4) %>%
+  kable_styling(bootstrap_options=c("striped", "hover"), full_width=FALSE)
+```
+
+The tuning plot tells a sharp and revealing story. For penalty values below roughly 1e-02, all four metrics remain essentially flat—accuracy around 0.567, ROC AUC around 0.578, sensitivity around 0.38, and specificity around 0.74. This means the model is relatively stable across a wide range of mild regularization, and most predictors are contributing at least some signal. However, once the penalty crosses approximately 1e-02, performance collapses dramatically: ROC AUC drops to 0.50 (coin flip level), sensitivity falls to near zero, and specificity jumps to 1.0. This is the signature of over-regularization. That is, the penalty has become so strong that Lasso zeroes out nearly all predictors and defaults to predicting Low Occupancy for every listing, which technically maximizes specificity but destroys any real predictive ability. The best Lasso model achieved accuracy of 0.568 and ROC AUC of 0.577, nearly identical to the elastic net results. This similarity makes sense given that the elastic net's best configuration already favored a low Lasso mixture, suggesting that Ridge-style shrinkage (keeping all predictors small rather than eliminating them) is slightly more appropriate for this dataset than pure variable elimination.
+
+## Model 4: Elastic Net (Tuned)
+
+Elastic net is a regularized version of logistic regression that applies a penalty to the model's coefficients to prevent overfitting. It combines two types of regularization (Lasso and Ridge) controlled by two parameters: `penalty` (strength of regularization) and `mixture` (0 = pure Ridge, 1 = pure Lasso, values in between blend both). Elastic net can also perform implicit variable selection by shrinking unimportant coefficients toward zero.
+
+```{r enet-tune}
+enet_model <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+enet_workflow <- workflow() %>%
+  add_recipe(airbnb_recipe) %>%
+  add_model(enet_model)
+
+enet_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  mixture(range = c(0, 1)),
+  levels = 5
+)
+
+set.seed(123)
+enet_tune_res <- tune_grid(
+  enet_workflow,
+  resamples = airbnb_folds,
+  grid      = enet_grid,
+  metrics   = metric_set(accuracy, roc_auc)
+)
+
+autoplot(enet_tune_res) +
+  labs(title = "Elastic Net: Tuning Penalty and Mixture") +
+  theme_minimal(base_size = 12)
+```
+
+```{r enet-best}
+best_enet <- select_best(enet_tune_res, metric = "roc_auc")
+cat("Best penalty:", best_enet$penalty, "\n")
+cat("Best mixture:", best_enet$mixture, "\n")
+
+enet_final_workflow <- finalize_workflow(enet_workflow, best_enet)
+
+enet_res <- fit_resamples(
+  enet_final_workflow,
+  resamples = airbnb_folds,
+  metrics   = metric_set(accuracy, roc_auc, sens, spec),
+  control   = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(enet_res) %>%
+  select(.metric, mean, std_err) %>%
+  rename(Metric = .metric, Mean = mean, `Std Error` = std_err) %>%
+  kable(caption = "Elastic Net (Tuned): Cross-Validation Performance", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The tuning plot shows that low regularization (left side of the x-axis) works best regardless of the Lasso/Ridge mixture, and performance drops off as regularization increases—meaning the model needs most of its predictors and shrinking them too hard hurts it. The pure Ridge (mixture = 0.00, pink line) degrades most gracefully, while pure Lasso (1.00) collapses fastest. Best performance: accuracy \~0.567, ROC AUC \~0.577. However, sensitivity dropped to 0.382, meaning it's missing a lot of actual High Occupancy listings. This model is playing it safe and predicting Low Occupancy too often.
+
+## Model 5: K-Nearest Neighbors (KNN)
+
+K-Nearest Neighbors (KNN) is a simple but intuitive classification algorithm. Rather than learning a set of coefficients or rules like logistic regression or a decision tree, KNN makes predictions by looking at the *k* most similar listings in the training data and taking a majority vote among their labels. For example, if k = 20 and 13 of the 20 nearest neighbors are "High Occupancy," the model predicts High Occupancy for that listing. The key tuning parameter is k. Smaller k values make the model more sensitive to individual data points (risking overfitting), while larger k values smooth out predictions but may miss local patterns. Because KNN relies entirely on distance between observations, it requires that all predictors be on the same scale, which is why the normalized recipe is used here.
+
+```{r KNN-tune}
+knn_model <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+knn_workflow <- workflow() %>%
+  add_recipe(airbnb_recipe) %>%
+  add_model(knn_model)
+
+# Tuning grid: try k = 5, 10, 15, 20, 25, 30
+knn_grid <- tibble(neighbors = c(5, 10, 15, 20, 25, 30))
+
+set.seed(123)
+knn_res <- tune_grid(
+  knn_workflow,
+  resamples = airbnb_folds,
+  grid = knn_grid,
+  metrics = metric_set(accuracy, roc_auc, sens, spec),
+  control = control_grid(save_pred = TRUE)
+)
+
+# Plot tuning results
+autoplot(knn_res) + 
+  labs(title = "KNN: Tuning Number of Neighbors")
+  theme_minimal(base_size=12)
+
+```
+
+```{r KNN-best}
+# Best KNN parameters
+show_best(knn_res, metric = "roc_auc", n = 5)
+
+# Finalize KNN with best k
+best_knn <- select_best(knn_res, metric = "roc_auc")
+
+knn_final_workflow <- finalize_workflow(knn_workflow, best_knn)
+
+knn_final_res <- fit_resamples(
+  knn_final_workflow,
+  resamples = airbnb_folds,
+  metrics = metric_set(accuracy, roc_auc, sens, spec),
+  control = control_resamples(save_pred = TRUE)
+)
+
+# KNN tuned CV performance
+collect_metrics(knn_final_res) %>%
+  select(.metric, mean, std_err) %>%
+  rename(Metric = .metric, Mean=mean, `Std Error`=std_err) %>%
+  kable(caption="KNN (Tuned): Cross-Validation Performance", digits=4) %>%
+  kable_styling(bootstrap_options=c("striped", "hover"), full_width=FALSE)
+```
+
+The tuning plot reveals a clear and informative pattern. Both accuracy and ROC AUC improve steadily as *k* increases from 10 to 20, then level off and plateaus. This suggests that larger neighborhoods provide more stable, generalizable predictions for this dataset. Sensitivity decreases gradually with larger *k*, while specificity increases, indicating a trade-off: as the model becomes more conservative, it correctly identifies more Low Occupancy listings but misses more High Occupancy ones. The best configuration, selected by ROC AUC, achieved an accuracy of 0.582 and a ROC AUC of 0.615. This places KNN meaningfully above the baseline logistic regression and decision tree, and makes it the second-best model so far behind the random forest. The relatively strong specificity (0.639) compared to sensitivity (0.518) suggests the model is more confident identifying listings that are *not* high occupancy than those that are.
+
+## Model 7: Linear Discriminant Analysis (LDA)
+
+Linear Discriminant Analysis (LDA) is a classical classification method that works by finding a linear combination of predictors that best separates the two classes—in this case, High Occupancy and Low Occupancy listings. LDA assumes that both classes follow a normal distribution and share the same covariance structure, meaning the spread and correlation of predictors is assumed to be the same for both groups. Because of this shared covariance assumption, LDA draws a straight (linear) boundary between classes. It is a simple, interpretable model with no hyperparameters to tune, making it a useful benchmark for understanding how much signal exists in the data when a clean linear separation is assumed.
+
+```{r LDA and QDA Recipe}
+# ── LDA and QDA Recipe ────────────────────────────────────────────────────────
+# LDA and QDA in tidymodels work best without step_dummy one-hot encoding.
+# We use step_dummy with one_hot = FALSE (reference coding) and no step_normalize
+# since these models handle scaling internally via covariance estimation.
+
+lda_qda_recipe <- recipe(high_occupancy ~ ., data = airbnb_train) %>%
+  update_role(availability_365, new_role = "ID") %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+  step_zv(all_predictors())
+```
+
+```{r LDA}
+# LDA has no hyperparameters to tune, so we go straight to fit_resamples
+
+lda_model <- discrim_linear() %>%
+  set_engine("MASS") %>%
+  set_mode("classification")
+
+lda_workflow <- workflow() %>%
+  add_recipe(lda_qda_recipe) %>%
+  add_model(lda_model)
+
+set.seed(123)
+lda_res <- fit_resamples(
+  lda_workflow,
+  resamples = airbnb_folds,
+  metrics = metric_set(accuracy, roc_auc, sens, spec),
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(lda_res) %>%
+  select(.metric, mean, std_err) %>%
+  rename(Metric=.metric, Mean=mean, `Std Error`=std_err) %>%
+  kable(caption="LDA: Cross-Validation Performance", digits=4) %>%
+  kable_styling(bootstrap_options=c("striped", "hover"), full_width=FALSE)
+
+```
+
+LDA performed modestly, achieving an accuracy of 0.567 and a ROC AUC of 0.577. These numbers are nearly identical to both Lasso and the Elastic Net, which is not surprising. All three models are fundamentally drawing linear decision boundaries through the predictor space. Sensitivity is notably low (\~0.390) , meaning LDA correctly identifies a mere 39% of actual High Occupancy listings, while its specificity of 0.726 indicates it is much better at correctly identifying Low Occupancy listings. This imbalance between sensitivity and specificity is a recurring pattern across the linear models in this project, suggesting that the features available in this dataset provide cleaner signal for ruling out high occupancy than for confirming it. Overall, LDA performs competitively with other linear approaches but falls well short of the random forest and KNN.
+
+## Model 8: QDA
+
+Quadratic Discriminant Analysis (QDA) is a natural extension of LDA that relaxes its key assumption. While LDA requires both classes to share the same covariance structure, QDA allows each class to have its own separate covariance matrix. This means QDA can draw curved (quadratic) decision boundaries rather than straight lines, making it more flexible and capable of capturing nonlinear relationships between predictors and the outcome. However, this added flexibility comes at a cost. QDA must estimate more parameters, which requires more data and is more sensitive to noise. It also becomes unstable when predictors are highly correlated or when some classes have very few observations relative to the number of predictors.
+
+```{r QDA}
+# QDA also has no hyperparameters to tune.
+# Note: QDA can fail if any class has too few observations or near-singular
+# covariance matrix. If you get errors, try removing low-variance predictors.
+
+qda_model <- discrim_quad() %>%
+  set_engine("MASS") %>%
+  set_mode("classification")
+
+qda_workflow <- workflow() %>%
+  add_recipe(lda_qda_recipe) %>%
+  add_model(qda_model)
+
+set.seed(123)
+qda_res <- fit_resamples(
+  qda_workflow,
+  resamples = airbnb_folds,
+  metrics = metric_set(accuracy, roc_auc, sens, spec),
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(qda_res) %>%
+  select(.metric, mean, std_err) %>%
+  rename(Metric=.metric, Mean=mean, `Std Error`=std_err) %>%
+  kable(caption="QDA: Cross-Validation Performance",digits = 4) %>%
+  kable_styling(bootstrap_options=c("striped", "hover"), full_width=FALSE)
+
+```
+
+QDA turned out to be the weakest model in this project, achieving an accuracy of 0.527 and a ROC AUC of 0.547—both only marginally better than random chance. Notably, the standard errors for sensitivity (0.115) and specificity (0.117) are dramatically larger than those of any other model, roughly 10 to 20 times larger. This is a strong warning sign: the model is behaving very inconsistently across cross-validation folds, producing wildly different sensitivity and specificity estimates each time. This instability is likely caused by the large number of dummy-encoded neighborhood variables, which creates a high-dimensional predictor space that QDA struggles to handle. Estimating a separate covariance matrix per class becomes unreliable when there are many predictors relative to observations per class. In short, the added flexibility of QDA backfired here, and the model is not appropriate for this dataset in its current form. This result is itself informative: it suggests that if nonlinear patterns exist in this data, they are not of the kind that QDA is designed to capture.
+
+## Model 9: Random Forest (Tuned)
+
+A random forest builds many decision trees in parallel, each trained on a random bootstrap sample of the data and a random subset of features. The final prediction is made by aggregating ("voting") across all trees. This reduces the variance problem of individual trees and typically achieves strong predictive performance. We tune three hyperparameters: `mtry` (number of features randomly considered at each split), `trees` (number of trees in the forest), and `min_n` (minimum number of observations in a leaf node).
+
+```{r rf-tune}
+rf_model <- rand_forest(
+  mtry  = tune(),
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_workflow <- workflow() %>%
+  add_recipe(airbnb_recipe) %>%
+  add_model(rf_model)
+
+# Number of predictors (after recipe prep) for mtry upper bound
+n_pred <- airbnb_recipe %>%
+  prep() %>%
+  bake(new_data = NULL) %>%
+  select(-high_occupancy, -availability_365) %>%
+  ncol()
+
+rf_grid <- grid_regular(
+  mtry(range  = c(2, floor(sqrt(n_pred)) + 3)),
+  trees(range = c(100, 500)),
+  min_n(range = c(5, 20)),
+  levels = 3
+)
+
+set.seed(123)
+rf_tune_res <- tune_grid(
+  rf_workflow,
+  resamples = airbnb_folds,
+  grid      = rf_grid,
+  metrics   = metric_set(accuracy, roc_auc),
+  control   = control_grid(verbose = FALSE)
+)
+
+autoplot(rf_tune_res) +
+  labs(title = "Random Forest: Tuning Results") +
+  theme_minimal(base_size = 12)
+```
+
+```{r rf-best}
+best_rf <- select_best(rf_tune_res, metric = "roc_auc")
+cat("Best mtry:", best_rf$mtry, "\n")
+cat("Best trees:", best_rf$trees, "\n")
+cat("Best min_n:", best_rf$min_n, "\n")
+
+rf_final_workflow <- finalize_workflow(rf_workflow, best_rf)
+
+rf_res <- fit_resamples(
+  rf_final_workflow,
+  resamples = airbnb_folds,
+  metrics   = metric_set(accuracy, roc_auc, sens, spec),
+  control   = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(rf_res) %>%
+  select(.metric, mean, std_err) %>%
+  rename(Metric = .metric, Mean = mean, `Std Error` = std_err) %>%
+  kable(caption = "Random Forest (Tuned): Cross-Validation Performance", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The tuned random forest is the best-performing model in this comparison, and the cross-validation results support that conclusion on three separate grounds: [magnitude]{.underline}, [stability]{.underline}, and [mechanism]{.underline}.
+
+**Magnitude.** Its cross-validation ROC AUC of 0.6466 is the highest of all eight models tested. Specifically, it's roughly 3 points above the second-best model, KNN (0.615), about 7 points above the cluster of linear models (Lasso, elastic net, logistic regression, and LDA, all within 0.577–0.578), and nearly 10 points above QDA (0.547), which performs only marginally better than chance. A gap of this size, especially relative to the tight clustering of every linear method, suggests the random forest is capturing real nonlinear structure or interactions among predictors that a linear decision boundary cannot.
+
+**Stability.** The random forest's standard error across folds (0.0026) is among the smallest of any model tested, in contrast to QDA's much larger standard errors noted earlier. A model that is both more accurate *and* more consistent across folds is a stronger candidate than one that wins on average but varies widely fold to fold.
+
+**Mechanism.** The tuning plot supports this with a specific, interpretable pattern. Performance peaks at `mtry = 5` across nearly all combinations of tree count and node size, then declines slightly as more predictors are considered per split. These results are consistent with the central mechanism behind random forests: restricting each split to a random subset of predictors decorrelates the individual trees, so their errors partially cancel out when averaged. Allowing `mtry` to grow toward the full predictor set re-correlates the trees (since they'd tend to split on the same dominant predictors, namely `price` and `price_per_person`), eroding that variance-reduction benefit. This is why performance declines past the mtry = 5 sweet spot rather than continuing to improve. Tree count shows the complementary pattern: 300–500 trees consistently outperform 100, particularly on ROC AUC, because averaging over more trees further reduces the variance of the ensemble prediction, though with diminishing returns. The `best_rf` configuration selected the grid maximum of 500 trees, suggesting the curve may not have fully plateaued hence, a finer search above 500 trees could be a natural extension.
+
+The final configuration (`mtry = 5`, `trees = 500`, `min_n = 5`) achieved a cross-validation accuracy of 0.6056 and ROC AUC of 0.6466. Sensitivity (0.4996) and specificity (0.7009) are notably imbalanced: at the default 0.5 classification threshold, the model is appreciably better at correctly identifying low-occupancy listings than high-occupancy ones. Given that the classes are nearly balanced by construction, this asymmetry is a property of the model's decision threshold rather than the data, and could be adjusted by lowering the classification threshold if catching high-occupancy listings were the analysis's priority. Note, this would be at the cost of some specificity.
+
+------------------------------------------------------------------------
+
+# Model Selection and Test Set Evaluation
+
+## Comparing All Models
+
+Now that all seven models have been evaluated using cross-validation on the training set, we can compare their performance side by side. The primary metric used for model selection is ROC AUC, which measures how well a model distinguishes between High and Low Occupancy listings across all possible classification thresholds. A ROC AUC of 0.5 indicates no better than random guessing, while 1.0 represents a perfect classifier. Accuracy, sensitivity (the proportion of true High Occupancy listings correctly identified), and specificity (the proportion of true Low Occupancy listings correctly identified) are also reported to give a fuller picture of each model's behavior.
+
+```{r model-comparison}
+all_results <- bind_rows(
+  collect_metrics(log_res)          %>% mutate(model = "Logistic Regression"),
+  collect_metrics(tree_res)         %>% mutate(model = "Decision Tree (Tuned)"),
+  collect_metrics(knn_final_res)    %>% mutate(model = "KNN"),
+  collect_metrics(lasso_final_res)  %>% mutate(model = "Lasso"),
+  collect_metrics(enet_res)         %>% mutate(model = "Elastic Net (Tuned)"),
+  collect_metrics(lda_res)          %>% mutate(model = "LDA"),
+  collect_metrics(qda_res)          %>% mutate(model = "QDA"),
+  collect_metrics(rf_res)           %>% mutate(model = "Random Forest (Tuned)")
+)
+
+```
+
+```{r model-comparison-plot}
+all_results %>%
+  filter(.metric %in% c("roc_auc", "accuracy")) %>%
+  ggplot(aes(x = reorder(model, mean), y = mean, fill = model)) +
+  geom_col(show.legend = FALSE, width = 0.6) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err),
+                width = 0.2) +
+  facet_wrap(~ .metric, scales = "free_x",
+             labeller = labeller(.metric = c(accuracy = "Accuracy",
+                                             roc_auc  = "ROC AUC"))) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Blues", direction = -1) +
+  labs(
+    title = "Model Comparison: Cross-Validation Performance",
+    x     = NULL,
+    y     = "Mean Value (with Std Error)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+The model comparison chart makes the ranking clear. The random forest stands alone at the top, achieving the highest accuracy (0.606) and by far the highest ROC AUC (0.647) of any model tested. Its error bars are also notably small, indicating it is the most consistent performer across cross-validation folds. KNN comes in second on ROC AUC (0.615), meaningfully outperforming the cluster of linear models that occupy the middle of the rankings.
+
+Lasso, Elastic Net, Logistic Regression, and LDA are essentially indistinguishable from one another—all four land within a very narrow band of roughly 0.567–0.568 accuracy and 0.577–0.578 ROC AUC. This convergence is telling: it suggests that no linear model, regardless of how it handles regularization or distributional assumptions, can extract substantially more signal from these predictors than a simple logistic regression. The relationships between the available features and occupancy are either nonlinear, involve interactions, or are simply weak in a way that linear boundaries cannot resolve.
+
+The tuned decision tree performs similarly to the linear cluster on accuracy (0.564) but slightly better on ROC AUC (0.576), offering no meaningful advantage over simpler approaches. QDA is the clear outlier in the wrong direction. QDA's accuracy of 0.527 and ROC AUC of 0.547 place it only marginally above chance, and its large standard errors confirm it is unstable on this dataset.
+
+Overall, the pattern across all models is one of modest but real predictive signal. No model achieves the ROC AUC values typically considered "good" (above 0.70), which is consistent with the inherent noise in using availability as a proxy for occupancy. The random forest's advantage of capturing nonlinear relationships and predictor interactions, gives it a meaningful edge and makes it the clear choice for final evaluation on the test set.
+
+## Final Model: Test Set Performance
+
+We fit the final tuned random forest on the full training set and evaluate it on the test set (data the model has never seen).
+
+```{r rf-test-set}
+rf_final_fit <- last_fit(
+  rf_final_workflow,
+  split   = airbnb_split,
+  metrics = metric_set(accuracy, roc_auc, sens, spec)
+)
+
+collect_metrics(rf_final_fit) %>%
+  select(.metric, .estimate) %>%
+  rename(Metric = .metric, Estimate = .estimate) %>%
+  kable(caption = "Random Forest: Final Test Set Performance", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+
+```
+
+```{r confusion-matrix}
+
+rf_final_fit %>%
+  collect_predictions() %>%
+  conf_mat(truth = high_occupancy, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  scale_fill_gradient(low = "#BBDEFB", high = "#1565C0") +
+  labs(title = "Confusion Matrix: Random Forest on Test Set") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+```
+
+### ROC Curve
+
+```{r roc-curve}
+rf_final_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = high_occupancy, `.pred_High Occupancy`) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_abline(lty = 2, color = "gray50") +
+  geom_path(color = "#2196F3") +
+  labs(title = "ROC Curve: Random Forest on Test Set") +
+  theme_minimal(base_size = 12)
+```
+
+### KNN Test-Set
+
+Second best model test set evaluation.
+
+```{r knn-test-set}
+knn_final_fit <- last_fit(
+  knn_final_workflow,
+  split   = airbnb_split,
+  metrics = metric_set(accuracy, roc_auc, sens, spec)
+)
+
+collect_metrics(knn_final_fit) %>%
+  select(.metric, .estimate) %>%
+  rename(Metric = .metric, Estimate = .estimate) %>%
+  kable(caption = "KNN: Final Test Set Performance", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### RF vs. KNN Comparison
+
+Comparing the two best-performing models on the held-out test set, the random forest outperforms KNN on every metric. The random forest achieved an accuracy of 0.623 and a ROC AUC of 0.674 on the test set, while KNN posted an accuracy of 0.581 and a ROC AUC of 0.613. Both gaps are large enough to be statistically robust and practically significant. The random forest's ROC AUC is roughly 6 percentage points higher, a practically significant difference when predicting a noisy outcome like occupancy.
+
+The two models also behave differently in terms of sensitivity versus specificity. KNN achieved a sensitivity of 0.509 and a specificity of 0.646, meaning it is somewhat better at correctly identifying low-occupancy listings than high-occupancy ones. KNN errs on the side of caution. The random forest shows a similar pattern but with better balance overall. Neither model aggressively predicts one class over the other, which is appropriate given that the classes are nearly balanced by construction.
+
+Crucially, both models generalize well from cross-validation to the test set. The random forest's cross-validation ROC AUC of 0.647 was off by roughly 2.7 percentage points compared to it's test set performance. The KNN's cross-validation ROC AUC was only off by less than 0.01 percentage points (CV ROC AUC of 0.615 vs. test ROC AUC of 0.613). This consistency indicates that neither model overfit the training data, and that our cross-validation estimates were reliable.
+
+## Variable Importance
+
+One advantage of tree-based models is that they provide a measure of **variable importance**— how much each feature contributed to the model's predictions. We fit the final model on the training set and extract these importances.
+
+```{r}
+rf_final_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 15) +
+  labs(title = "Variable Importance: Random Forest") +
+  theme_minimal(base_size = 12) + 
+  geom_col(fill="#48cae4", color="black")
+```
+
+The variable importance plot reveals a clear hierarchy of predictors in the random forest model. `price` and `price_per_person` dominate by a wide margin, together accounting for far more importance than any other features. This is consistent with our EDA finding that high-occupancy listings tend to charge lower prices per person and price sensitivity appears to be the single strongest driver of booking demand in the Athens market.
+
+Review-related variables come next: `number_of_reviews` and `review_scores_rating` are the third and fourth most important features, respectively. This makes intuitive sense. Listings with more reviews signal an established booking history, and higher ratings reduce friction for potential guests. Together, pricing and review signals account for the bulk of the model's predictive power.
+
+Physical capacity features (beds, accommodates, bedrooms) rank in the middle tier, contributing meaningfully but far less than price and reviews. For a project focused on group travel, this is a notable finding: group suitability alone does not appear to be what differentiates high-occupancy listings. **Affordability matters more than size**.
+
+At the bottom of the ranking are host characteristics (`instant_bookable`, `host_is_superhost`) and specific neighborhood indicators. Several central Athens neighborhoods carry modest but measurable importance, suggesting that location does play a role, just a smaller one relative to pricing and reputation. The low importance of superhost status echoes our EDA, which showed nearly identical occupancy rates between superhost and non-superhost listings.
+
+## Conclusion
+
+This project set out to predict whether an Airbnb listing in Athens achieves high occupancy—defined as below-median availability over the calendar year—using publicly available listing data from Inside Airbnb. Eight classification models were fit and compared using five-fold cross-validation: logistic regression, a pruned decision tree, Lasso, elastic net, KNN, LDA, QDA, and a tuned random forest. The models spanned a range of complexity, from simple linear boundaries to ensemble methods capable of capturing nonlinear relationships and predictor interactions.
+
+The results told a consistent story. All linear models (logistic regression, Lasso, elastic net, and LDA) converged to nearly identical performance, with ROC AUC values in the narrow range of 0.577–0.578. This convergence suggests that the relationships between available predictors and occupancy are not well-captured by linear decision boundaries, and that adding regularization or changing distributional assumptions provides no meaningful benefit over a simple logistic regression baseline. QDA performed worst of all, likely because the large number of dummy-encoded neighborhood variables made its covariance estimation unstable. The **random forest was the clear winner**, achieving a cross-validation ROC AUC of 0.647 and a score of 0.674 on the test set. KNN came in second at 0.613, confirming that nonlinear, distance-based methods extract more signal from this data than linear approaches.
+
+The **variable importance analysis** provided the most interpretable findings of the project. `price` and `price_per_person` dominated the random forest's decision-making by a large margin, with review count and rating score following as the next most important signals. Physical capacity features like beds and accommodates contributed modestly, while host characteristics and neighborhood indicators ranked at the bottom. For a project motivated by group travel, this is a [meaningful takeawa]{.underline}y: **affordability matters far more than group size** **suitability** **when it comes to driving bookings in Athens**. A host looking to maximize occupancy would benefit more from competitive pricing than from increasing capacity.
+
+**Several limitations are worth acknowledging**. The outcome variable (`availability_365`) is an imperfect proxy for occupancy, since hosts may block dates for personal use or seasonal closures rather than lack of demand. This adds noise to the labels and almost certainly suppresses overall model performance. Additionally, the dataset lacks booking history or revenue data, which would provide a more direct measure of success. Future work could incorporate time-series features, seasonal patterns, or text-based signals from listing descriptions and reviews to improve predictive power. It would also be interesting to explore whether the findings hold in other competitive European tourism markets, or whether the dominance of price as a predictor is specific to Athens.
+
+<img src="Acropolis.jpeg" alt="Photo of Acropolis" width="700"/>
+
+# Appendix/Codebook
+
+## Dataset Overview
+
+**Source:** Inside Airbnb—Athens, Attica, Greece listings (September 26, 2025). Retrieved from <https://insideairbnb.com/get-the-data/>
+
+**File used:** `listings.csv` (detailed listings data)
+
+**Observations after cleaning:** 14,524 listings
+
+**Predictors in final model:** 12 (plus 1 outcome variable and 1 ID variable)
+
+## Preprocessing Notes
+
+Before model fitting, the following steps were applied via a tidymodels recipe:
+
+- **Numeric imputation:** Missing values replaced with the column median (`step_impute_median`)
+- **Categorical imputation:** Missing values replaced with the column mode (`step_impute_mode`)
+- **Rare level collapsing:** Factor levels appearing in fewer than 1% of training rows collapsed into `"other"` (`step_other`, threshold = 0.01)
+- **Dummy encoding:** All nominal predictors one-hot encoded with a reference level dropped (`step_dummy`)
+- **Zero-variance removal:** Predictors with no variance removed (`step_zv`)
+- **Normalization:** All numeric predictors centered and scaled to mean 0 / SD 1 (`step_normalize`)
+- **ID role:** `availability_365` assigned the role `"ID"` and excluded from all model predictors (`update_role`)
+
+## Variable Definitions
+
+| Variable | Type | Role | Description |
+|------------------|------------------|------------------|------------------|
+| `high_occupancy` | Factor (binary) | Outcome | Target variable. `"High Occupancy"` if `availability_365` is below the median; `"Low Occupancy"` otherwise. Derived from `availability_365`. |
+| `availability_365` | Integer | ID / excluded | Number of days the listing is available for booking over the next 365 days. Used only to construct `high_occupancy`; excluded from model predictors. |
+| `price` | Numeric | Predictor | Nightly listing price in euros (€). Parsed from a character string containing currency symbols. **6.8% of listings were missing price; these rows were dropped via listwise deletion during cleaning (`filter(!is.na(price))`) rather than imputed, since price is also the basis for the engineered `price_per_person` feature and later emerges as the model's strongest predictor.** |
+| `price_per_person` | Numeric | Predictor | Engineered feature: `price / accommodates`. Represents the nightly cost per guest—a more relevant affordability measure for group travel. |
+| `accommodates` | Integer | Predictor | Maximum number of guests the listing can accommodate. Also used as the denominator in `price_per_person`. |
+| `bedrooms` | Numeric | Predictor | Number of bedrooms in the listing. Contains missing values; imputed with the median during preprocessing. |
+| `beds` | Numeric | Predictor | Number of beds in the listing. Distinct from `bedrooms` — a studio may have 1 bedroom but multiple beds. |
+| `room_type` | Factor | Predictor | Type of space offered. Levels: `"Entire home/apt"`, `"Private room"`, `"Hotel room"`, `"Shared room"`. Dummy-encoded during preprocessing. |
+| `number_of_reviews` | Integer | Predictor | Total number of guest reviews the listing has received. Used as a proxy for booking history. |
+| `review_scores_rating` | Numeric | Predictor | Overall guest rating on a 0–5 scale. Contains missing values for listings with no reviews; imputed with the median during preprocessing. |
+| `host_is_superhost` | Factor (binary) | Predictor | Whether the host holds Airbnb's Superhost designation. Values: `"t"` (TRUE) or `"f"` (FALSE). |
+| `instant_bookable` | Factor (binary) | Predictor | Whether the listing can be booked immediately without host approval. Values: `"t"` (TRUE) or `"f"` (FALSE). |
+| `neighbourhood_cleansed` | Factor | Predictor | Standardized neighborhood name in Athens. Rare levels (\< 1% of listings) collapsed into `"other"` during preprocessing. Dummy-encoded. |
+
+*Note: The raw `listings.csv` contains approximately 70–75 additional columns (host biography, scrape metadata, URL fields, etc.) that were not used in this analysis.*
