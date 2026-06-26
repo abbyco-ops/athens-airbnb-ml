@@ -15,7 +15,7 @@ I framed this as a binary classication problem, predicitng whether a listing fal
 * **Outcome:** high_occupancy, derived from availability_365 (below-median availability = high occupancy)
 
 ## Approach
-1. **Exploratory Data Analysis: examined how price, room type, reviews, host status, and capacity relate to occupancy
+1. **Exploratory Data Analysis:** examined how price, room type, reviews, host status, and capacity relate to occupancy
 2. **Train/test split** (80/20 stratified) with **5-fold cross validation** for model tuning
 3. **Eight models compared:** Logistic Regression, Pruned Decisio Tree, Lasso, Elastic Net, KNN, LDA, QDA, and Random Forest
 4. **Model selection** via ROC AUC, with the winner evaluated on a held-out test set
@@ -28,7 +28,7 @@ The **Random Forest** was the best model, generalizing well to the test set (ROC
 **Price matters far more than capacity**. price and price_per_person dominate the Random Forest's variable importance rankings, well ahead of review volume/rating, and group-size features (beds, accommodates, bedrooms) rank in the middle. For hosts in Athens, competitive pricing appears to be a stronger lever for occupancy than adding capacity.
 
 ## Limitations
-* availability_365 is an imperfect proxy for occupancy — hosts can block dates for personal reasons unrelated to demand, which adds noise to the labels and likely suppresses model performance across the board.
+* availability_365 is an imperfect proxy for occupancy - hosts can block dates for personal reasons unrelated to demand, which adds noise to the labels and likely suppresses model performance across the board.
 * The dataset lacks booking history or revenue data, which would more directly capture demand.
 * Findings are specific to the Athens market as of the September 2025 snapshot.
 
