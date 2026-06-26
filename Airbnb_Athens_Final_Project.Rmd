@@ -19,7 +19,7 @@ Athens, Greece is one of Europe's most visited cities, drawing millions of touri
 
 This project uses publicaly available data from [Inside Airbnb](https://insideairbnb.com/get-the-data/){.uri} to **predict** whether an Airbnb listing in Athens achieves **high occupancy**. High occupancy is defined as a listing having below-median availability over the course of a year. This follows the idea that a listing with fewer open days has likely been booked more often. This is a **binary** **classification** **problem**: we want to predict whether a given listing falls into the "High Occupancy" or "Low Occupancy" category based on features like price, number of bedrooms, host characteristics, and neighborhood. To do this, we apply supervised machine learning techniques, training and **comparing several classification algorithms** on labeled listing data to find the model that best distinguishes high-occupancy listings from low-occupancy ones.
 
-<img src="Athens_Aura.JPG" alt="Photo From My Trip to Athens, Greece" width="700"/>
+<img src="images/Athens_Aura.JPG" alt="Photo From My Trip to Athens, Greece" width="700"/>
 
 ## Project Roadmap
 
@@ -938,7 +938,7 @@ The **variable importance analysis** provided the most interpretable findings of
 
 **Several limitations are worth acknowledging**. The outcome variable (`availability_365`) is an imperfect proxy for occupancy, since hosts may block dates for personal use or seasonal closures rather than lack of demand. This adds noise to the labels and almost certainly suppresses overall model performance. Additionally, the dataset lacks booking history or revenue data, which would provide a more direct measure of success. Future work could incorporate time-series features, seasonal patterns, or text-based signals from listing descriptions and reviews to improve predictive power. It would also be interesting to explore whether the findings hold in other competitive European tourism markets, or whether the dominance of price as a predictor is specific to Athens.
 
-<img src="Acropolis.jpeg" alt="Photo of Acropolis" width="700"/>
+<img src="images/Acropolis.jpeg" alt="Photo of Acropolis" width="700"/>
 
 # Appendix/Codebook
 
@@ -967,7 +967,7 @@ Before model fitting, the following steps were applied via a tidymodels recipe:
 ## Variable Definitions
 
 | Variable | Type | Role | Description |
-|------------------|------------------|------------------|------------------|
+|----|----|----|----|
 | `high_occupancy` | Factor (binary) | Outcome | Target variable. `"High Occupancy"` if `availability_365` is below the median; `"Low Occupancy"` otherwise. Derived from `availability_365`. |
 | `availability_365` | Integer | ID / excluded | Number of days the listing is available for booking over the next 365 days. Used only to construct `high_occupancy`; excluded from model predictors. |
 | `price` | Numeric | Predictor | Nightly listing price in euros (€). Parsed from a character string containing currency symbols. **6.8% of listings were missing price; these rows were dropped via listwise deletion during cleaning (`filter(!is.na(price))`) rather than imputed, since price is also the basis for the engineered `price_per_person` feature and later emerges as the model's strongest predictor.** |
