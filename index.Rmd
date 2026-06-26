@@ -587,13 +587,11 @@ knn_res <- tune_grid(
   knn_workflow,
   resamples = airbnb_folds,
   grid = knn_grid,
-  metrics = metric_set(accuracy, roc_auc, sens, spec),
-  control = control_grid(save_pred = TRUE)
-)
+  metrics = metric_set(accuracy, roc_auc, sens, spec))
 
 # Plot tuning results
 autoplot(knn_res) + 
-  labs(title = "KNN: Tuning Number of Neighbors")
+  labs(title = "KNN: Tuning Number of Neighbors") +
   theme_minimal(base_size=12)
 
 ```
@@ -624,7 +622,7 @@ collect_metrics(knn_final_res) %>%
 
 The tuning plot reveals a clear and informative pattern. Both accuracy and ROC AUC improve steadily as *k* increases from 10 to 20, then level off and plateaus. This suggests that larger neighborhoods provide more stable, generalizable predictions for this dataset. Sensitivity decreases gradually with larger *k*, while specificity increases, indicating a trade-off: as the model becomes more conservative, it correctly identifies more Low Occupancy listings but misses more High Occupancy ones. The best configuration, selected by ROC AUC, achieved an accuracy of 0.582 and a ROC AUC of 0.615. This places KNN meaningfully above the baseline logistic regression and decision tree, and makes it the second-best model so far behind the random forest. The relatively strong specificity (0.639) compared to sensitivity (0.518) suggests the model is more confident identifying listings that are *not* high occupancy than those that are.
 
-## Model 7: Linear Discriminant Analysis (LDA)
+## Model 6: Linear Discriminant Analysis (LDA)
 
 Linear Discriminant Analysis (LDA) is a classical classification method that works by finding a linear combination of predictors that best separates the two classes—in this case, High Occupancy and Low Occupancy listings. LDA assumes that both classes follow a normal distribution and share the same covariance structure, meaning the spread and correlation of predictors is assumed to be the same for both groups. Because of this shared covariance assumption, LDA draws a straight (linear) boundary between classes. It is a simple, interpretable model with no hyperparameters to tune, making it a useful benchmark for understanding how much signal exists in the data when a clean linear separation is assumed.
 
@@ -672,7 +670,7 @@ collect_metrics(lda_res) %>%
 
 LDA performed modestly, achieving an accuracy of 0.567 and a ROC AUC of 0.577. These numbers are nearly identical to both Lasso and the Elastic Net, which is not surprising. All three models are fundamentally drawing linear decision boundaries through the predictor space. Sensitivity is notably low (\~0.390) , meaning LDA correctly identifies a mere 39% of actual High Occupancy listings, while its specificity of 0.726 indicates it is much better at correctly identifying Low Occupancy listings. This imbalance between sensitivity and specificity is a recurring pattern across the linear models in this project, suggesting that the features available in this dataset provide cleaner signal for ruling out high occupancy than for confirming it. Overall, LDA performs competitively with other linear approaches but falls well short of the random forest and KNN.
 
-## Model 8: QDA
+## Model 7: QDA
 
 Quadratic Discriminant Analysis (QDA) is a natural extension of LDA that relaxes its key assumption. While LDA requires both classes to share the same covariance structure, QDA allows each class to have its own separate covariance matrix. This means QDA can draw curved (quadratic) decision boundaries rather than straight lines, making it more flexible and capable of capturing nonlinear relationships between predictors and the outcome. However, this added flexibility comes at a cost. QDA must estimate more parameters, which requires more data and is more sensitive to noise. It also becomes unstable when predictors are highly correlated or when some classes have very few observations relative to the number of predictors.
 
@@ -707,7 +705,7 @@ collect_metrics(qda_res) %>%
 
 QDA turned out to be the weakest model in this project, achieving an accuracy of 0.527 and a ROC AUC of 0.547—both only marginally better than random chance. Notably, the standard errors for sensitivity (0.115) and specificity (0.117) are dramatically larger than those of any other model, roughly 10 to 20 times larger. This is a strong warning sign: the model is behaving very inconsistently across cross-validation folds, producing wildly different sensitivity and specificity estimates each time. This instability is likely caused by the large number of dummy-encoded neighborhood variables, which creates a high-dimensional predictor space that QDA struggles to handle. Estimating a separate covariance matrix per class becomes unreliable when there are many predictors relative to observations per class. In short, the added flexibility of QDA backfired here, and the model is not appropriate for this dataset in its current form. This result is itself informative: it suggests that if nonlinear patterns exist in this data, they are not of the kind that QDA is designed to capture.
 
-## Model 9: Random Forest (Tuned)
+## Model 8: Random Forest (Tuned)
 
 A random forest builds many decision trees in parallel, each trained on a random bootstrap sample of the data and a random subset of features. The final prediction is made by aggregating ("voting") across all trees. This reduces the variance problem of individual trees and typically achieves strong predictive performance. We tune three hyperparameters: `mtry` (number of features randomly considered at each split), `trees` (number of trees in the forest), and `min_n` (minimum number of observations in a leaf node).
 
@@ -967,7 +965,7 @@ Before model fitting, the following steps were applied via a tidymodels recipe:
 ## Variable Definitions
 
 | Variable | Type | Role | Description |
-|----|----|----|----|
+|------------------|------------------|------------------|------------------|
 | `high_occupancy` | Factor (binary) | Outcome | Target variable. `"High Occupancy"` if `availability_365` is below the median; `"Low Occupancy"` otherwise. Derived from `availability_365`. |
 | `availability_365` | Integer | ID / excluded | Number of days the listing is available for booking over the next 365 days. Used only to construct `high_occupancy`; excluded from model predictors. |
 | `price` | Numeric | Predictor | Nightly listing price in euros (€). Parsed from a character string containing currency symbols. **6.8% of listings were missing price; these rows were dropped via listwise deletion during cleaning (`filter(!is.na(price))`) rather than imputed, since price is also the basis for the engineered `price_per_person` feature and later emerges as the model's strongest predictor.** |
